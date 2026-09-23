@@ -1440,6 +1440,94 @@ function checkRoomStatus(roomId: string): { exists: boolean; isClosed?: boolean;
   return { exists: false };
 }
 
+function getFirebaseServerConfig() {
+  let apiKey = process.env.VITE_FIREBASE_API_KEY || process.env.FIREBASE_API_KEY || "";
+  let projectId = process.env.VITE_FIREBASE_PROJECT_ID || process.env.FIREBASE_PROJECT_ID || "";
+
+  if (!apiKey || !projectId) {
+    try {
+      const configPath = path.join(process.cwd(), "firebase-applet-config.json");
+      if (fs.existsSync(configPath)) {
+        const raw = JSON.parse(fs.readFileSync(configPath, "utf8"));
+        apiKey = apiKey || raw.apiKey;
+        projectId = projectId || raw.projectId;
+      }
+    } catch {}
+  }
+  return { apiKey, projectId };
+}
+
+async function loadRoomFromFirestoreOnServer(roomId: string, idToken?: string): Promise<{
+  exists: boolean;
+  status: string;
+  name: string;
+  ownerId: string;
+  files?: ServerProjectFile[];
+} | null> {
+  const { projectId } = getFirebaseServerConfig();
+  if (!projectId || !roomId) return null;
+
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/rooms/${encodeURIComponent(roomId)}`;
+    const headers: Record<string, string> = {};
+    if (idToken) {
+      headers["Authorization"] = `Bearer ${idToken}`;
+    }
+
+    const res = await fetch(url, { headers });
+    if (res.status === 404) {
+      return { exists: false, status: "not_found", name: "", ownerId: "" };
+    }
+    if (res.status === 200) {
+      const doc = await res.json() as any;
+      const fields = doc.fields || {};
+      const status = fields.status?.stringValue || "active";
+      const name = fields.name?.stringValue || "CODE DEATH Workspace";
+      const ownerId = fields.ownerId?.stringValue || fields.hostId?.stringValue || fields.createdBy?.stringValue || "";
+
+      let fetchedFiles: ServerProjectFile[] = [];
+      try {
+        const filesUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/rooms/${encodeURIComponent(roomId)}/files`;
+        const filesRes = await fetch(filesUrl, { headers });
+        if (filesRes.status === 200) {
+          const filesData = await filesRes.json() as any;
+          if (filesData.documents && Array.isArray(filesData.documents)) {
+            for (const d of filesData.documents) {
+              const ff = d.fields || {};
+              const id = ff.id?.stringValue || path.basename(d.name);
+              fetchedFiles.push({
+                id,
+                roomId,
+                name: ff.name?.stringValue || id,
+                path: ff.path?.stringValue || id,
+                content: ff.content?.stringValue || "",
+                language: ff.language?.stringValue || "plaintext",
+                isFolder: ff.isFolder?.booleanValue || false,
+                parentPath: ff.parentPath?.stringValue || "",
+                version: ff.version?.integerValue ? Number(ff.version.integerValue) : 1,
+                updatedAt: ff.updatedAt?.stringValue || new Date().toISOString(),
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("Could not fetch files subcollection from Firestore:", err);
+      }
+
+      return {
+        exists: true,
+        status,
+        name,
+        ownerId,
+        files: fetchedFiles.length > 0 ? fetchedFiles : undefined,
+      };
+    }
+  } catch (err) {
+    console.warn("loadRoomFromFirestoreOnServer error:", err);
+  }
+  return null;
+}
+
 const USER_COLORS = [
   "#38bdf8", "#4ade80", "#f43f5e", "#fbbf24", 
   "#a855f7", "#ec4899", "#14b8a6", "#f97316"
@@ -2008,16 +2096,55 @@ async function startServer() {
 
   io.on("connection", (socket) => {
     // Join room
-    socket.on("join", ({ roomId, username, userColor, userId }) => {
+    socket.on("join", async ({ roomId, username, userColor, userId, idToken }) => {
       if (!roomId) return;
       if (closedRooms.has(roomId)) {
-        socket.emit("room-error", { message: "This room is no longer available." });
+        socket.emit("room-error", { 
+          code: "ROOM_CLOSED",
+          message: "This room is no longer available." 
+        });
         return;
       }
       const cleanUsername = username?.trim() || "Collaborator";
       const color = userColor || getRandomColor();
 
-      const room = getOrCreateRoom(roomId);
+      // Check persistent room metadata from Firestore
+      const firestoreData = await loadRoomFromFirestoreOnServer(roomId, idToken);
+      if (firestoreData) {
+        if (!firestoreData.exists) {
+          socket.emit("room-error", {
+            code: "ROOM_NOT_FOUND",
+            message: "Room does not exist or is closed."
+          });
+          return;
+        }
+        if (firestoreData.status === "closed" || firestoreData.status !== "active") {
+          socket.emit("room-error", {
+            code: "ROOM_CLOSED",
+            message: "This room has been closed."
+          });
+          return;
+        }
+      }
+
+      const room = getOrCreateRoom(roomId, firestoreData?.name || "Collaborative Workspace");
+      
+      // Preserve persistent ownerId from Firestore
+      if (firestoreData?.ownerId) {
+        room.owner = firestoreData.ownerId;
+      }
+      if (firestoreData?.name) {
+        room.roomname = firestoreData.name;
+      }
+      if (firestoreData?.files && firestoreData.files.length > 0 && room.files.size <= 2) {
+        room.files.clear();
+        for (const f of firestoreData.files) {
+          room.files.set(f.id, f);
+        }
+        replaceWorkspaceOnDisk(roomId, firestoreData.files);
+      }
+
+      // CRITICAL: Determine isHost strictly by comparing userId with persistent room.owner
       let isHost = false;
       if (room.owner && userId) {
         isHost = (room.owner === userId);
@@ -2682,23 +2809,89 @@ async function startServer() {
   });
 
   // Validate if a room exists and is joinable
-  app.get("/api/room/validate/:roomId", (req: Request, res: Response) => {
-    const { roomId } = req.params;
+  const handleValidateRoom = async (req: Request, res: Response) => {
+    const rawRoomId = (req.params.roomId || req.query.roomId || "") as string;
+    const roomId = rawRoomId.trim();
     if (!roomId) return res.status(400).json({ valid: false, message: "Room ID is required" });
-    const status = checkRoomStatus(roomId.trim());
+    
+    if (closedRooms.has(roomId)) {
+      return res.json({ 
+        valid: false, 
+        code: "ROOM_CLOSED",
+        reason: "closed", 
+        message: "This room is no longer available." 
+      });
+    }
+
+    // Extract optional Bearer token
+    const authHeader = req.headers.authorization || req.headers.Authorization as string || "";
+    let idToken = "";
+    if (typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
+      idToken = authHeader.substring(7).trim();
+    }
+
+    // 1. Authoritative check in Firestore
+    const firestoreData = await loadRoomFromFirestoreOnServer(roomId, idToken);
+    if (firestoreData) {
+      if (!firestoreData.exists) {
+        return res.json({ 
+          valid: false, 
+          code: "ROOM_NOT_FOUND",
+          reason: "not_found", 
+          message: "Room not found" 
+        });
+      }
+
+      if (firestoreData.status === "closed" || firestoreData.status !== "active") {
+        return res.json({ 
+          valid: false, 
+          code: "ROOM_CLOSED",
+          reason: "closed", 
+          message: "This room is no longer available." 
+        });
+      }
+
+      let room = rooms.get(roomId);
+      if (room) {
+        if (firestoreData.ownerId) room.owner = firestoreData.ownerId;
+        if (firestoreData.name) room.roomname = firestoreData.name;
+      }
+
+      return res.json({
+        valid: true,
+        roomId,
+        name: firestoreData.name,
+        roomname: firestoreData.name,
+        ownerId: firestoreData.ownerId,
+        status: "active",
+        isReadOnly: false,
+      });
+    }
+
+    // 2. Fallback to in-memory/disk check
+    const status = checkRoomStatus(roomId);
     if (status.isClosed) {
-      return res.json({ valid: false, reason: "closed", message: "This room is no longer available." });
+      return res.json({ valid: false, code: "ROOM_CLOSED", reason: "closed", message: "This room is no longer available." });
     }
     if (!status.exists) {
-      return res.json({ valid: false, reason: "not_found", message: "Room not found" });
+      return res.json({ valid: false, code: "ROOM_NOT_FOUND", reason: "not_found", message: "Room not found" });
     }
+
+    const memRoom = rooms.get(roomId);
     return res.json({
       valid: true,
-      roomname: status.roomname,
-      isReadOnly: status.isReadOnly,
-      hasPasscode: status.hasPasscode,
+      roomId,
+      name: status.roomname || "CODE DEATH Workspace",
+      roomname: status.roomname || "CODE DEATH Workspace",
+      ownerId: memRoom?.owner || "",
+      status: "active",
+      isReadOnly: status.isReadOnly || false,
+      hasPasscode: status.hasPasscode || false,
     });
-  });
+  };
+
+  app.get("/api/room/validate/:roomId", handleValidateRoom);
+  app.get("/api/room/validate", handleValidateRoom);
 
   // Explicitly create a new room
   app.post("/api/room/create", async (req: Request, res: Response) => {
@@ -2806,6 +2999,37 @@ async function startServer() {
     const room = getOrCreateRoom(targetId, targetRoomName);
     if (finalHostId) {
       room.owner = finalHostId;
+    }
+
+    if (finalHostId && idToken) {
+      const { projectId } = getFirebaseServerConfig();
+      if (projectId) {
+        try {
+          const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/rooms/${encodeURIComponent(targetId)}`;
+          const now = new Date().toISOString();
+          await fetch(url, {
+            method: "PATCH",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${idToken}`,
+            },
+            body: JSON.stringify({
+              fields: {
+                id: { stringValue: targetId },
+                name: { stringValue: targetRoomName },
+                hostId: { stringValue: finalHostId },
+                ownerId: { stringValue: finalHostId },
+                createdBy: { stringValue: finalHostId },
+                status: { stringValue: "active" },
+                createdAt: { stringValue: now },
+                updatedAt: { stringValue: now },
+              },
+            }),
+          });
+        } catch (err) {
+          console.warn("Could not sync room to Firestore from server:", err);
+        }
+      }
     }
 
     return res.status(201).json({

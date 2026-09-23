@@ -43,6 +43,7 @@ import { detectProject } from '../utils/projectDetector';
 import { getDefaultProjectFiles } from '../utils/defaultFiles';
 import { CollabDocSession, getDeterministicDocId } from '../services/collabProvider';
 import { 
+  updateRoomMetadataInFirestore,
   saveRoomToFirestore, 
   saveFilesToFirestore, 
   saveFileToFirestore,
@@ -50,6 +51,7 @@ import {
   deleteFileFromFirestore,
   saveMessageToFirestore,
   replaceWorkspaceInFirestore,
+  closeRoomInFirestore,
 } from '../services/firestoreService';
 
 import { 
@@ -277,12 +279,19 @@ export const RoomPage: FC = () => {
     const socket = initSocket();
     socketRef.current = socket;
 
-    socket.on('connect', () => {
+    socket.on('connect', async () => {
       setConnectionStatus('connected');
+      let idToken = '';
+      if (user) {
+        try {
+          idToken = await user.getIdToken();
+        } catch {}
+      }
       socket.emit(ACTIONS.JOIN, {
         roomId,
         username,
         userId: user?.uid,
+        idToken,
       });
     });
 
@@ -652,7 +661,7 @@ export const RoomPage: FC = () => {
       if (!roomId) return;
       setIsSaving(true);
       try {
-        await saveRoomToFirestore(roomId, roomname, username, activeFileId);
+        await updateRoomMetadataInFirestore(roomId, { name: roomname, activeFileId });
         await saveFilesToFirestore(roomId, filesRef.current);
       } catch (err) {
         console.warn('Auto-save error:', err);
@@ -880,7 +889,7 @@ export const RoomPage: FC = () => {
 
     try {
       if (roomId) {
-        await saveRoomToFirestore(roomId, roomname, username, activeFileId);
+        await updateRoomMetadataInFirestore(roomId, { name: roomname, activeFileId });
         await saveFilesToFirestore(roomId, filesRef.current);
       }
       toast.success('Workspace saved to Cloud Firestore!', { icon: '☁️' });
@@ -1349,10 +1358,10 @@ export const RoomPage: FC = () => {
 
   const myClient = clients.find((c) => c.username === username || (user?.uid && (c as any).userId === user.uid));
   // Authoritative host check based on Firebase Auth UID and roomHostId from database
-  // Strictly prevent false host attribution while room data is loading or for guests
+  // Strictly prevent false host attribution: UID must match persistent room owner
   const isHost = !isRoomLoading && Boolean(
     (user?.uid && roomHostId && user.uid === roomHostId) ||
-    (myClient?.isHost && (!roomHostId || (user?.uid && (myClient as any).userId === user.uid)))
+    (state?.isHost && (!roomHostId || (user?.uid && user.uid === roomHostId)))
   );
 
   // Save all files
@@ -1404,6 +1413,9 @@ export const RoomPage: FC = () => {
     if (!roomId) return;
     try {
       sessionStorage.removeItem(`cd_joined_${roomId}`);
+      if (user?.uid) {
+        await closeRoomInFirestore(roomId, user.uid);
+      }
       if (socketRef.current) {
         socketRef.current.emit(ACTIONS.DELETE_ROOM, { roomId });
       }
@@ -1413,7 +1425,7 @@ export const RoomPage: FC = () => {
     } catch {
       toast.error('Failed to delete workspace.');
     }
-  }, [roomId, navigate]);
+  }, [roomId, user?.uid, navigate]);
 
   const handleGoToLine = useCallback((line: number) => {
     setCursorPos({ line, col: 1 });

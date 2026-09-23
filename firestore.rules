@@ -21,7 +21,11 @@ service cloud.firestore {
     match /rooms/{roomId} {
       allow read: if isAuthenticated();
       allow create: if isAuthenticated() && request.resource.data.ownerId == request.auth.uid;
-      allow update: if isAuthenticated();
+      allow update: if isAuthenticated() && (
+        !('ownerId' in request.resource.data) || 
+        request.resource.data.ownerId == resource.data.ownerId || 
+        resource.data.ownerId == request.auth.uid
+      );
       allow delete: if isAuthenticated() && resource.data.ownerId == request.auth.uid;
 
       // Project files subcollection
@@ -34,7 +38,10 @@ service cloud.firestore {
       match /messages/{messageId} {
         allow read: if isAuthenticated();
         allow create: if isAuthenticated() && request.resource.data.senderId == request.auth.uid;
-        allow update, delete: if isAuthenticated() && (resource.data.senderId == request.auth.uid || request.auth.uid == get(/databases/$(database)/documents/rooms/$(roomId)).data.ownerId);
+        allow update, delete: if isAuthenticated() && (
+          resource.data.senderId == request.auth.uid || 
+          request.auth.uid == get(/databases/$(database)/documents/rooms/$(roomId)).data.ownerId
+        );
       }
 
       // Room participants subcollection

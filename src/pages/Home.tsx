@@ -4,7 +4,10 @@ import { v4 as uuidv4 } from 'uuid';
 import toast, { Toaster } from 'react-hot-toast';
 import { motion } from 'motion/react';
 import { useAuth } from '../context/AuthContext';
-import { saveRoomToFirestore } from '../services/firestoreService';
+import { createRoomInFirestore } from '../services/firestoreService';
+import { db } from '../firebase';
+import { doc, getDoc } from 'firebase/firestore';
+import { getDefaultProjectFiles } from '../utils/defaultFiles';
 import { CodeDeathLogo } from '../components/CodeDeathLogo';
 import { 
   Plus, 
@@ -104,46 +107,47 @@ export const HomePage: FC = () => {
 
     setIsValidating(true);
     try {
-      const idToken = await user.getIdToken();
-      const res = await fetch('/api/room/create', {
-        method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${idToken}`,
-        },
-        body: JSON.stringify({ 
-          roomId: finalRoomId, 
-          roomName: finalRoomName,
-          hostId: user.uid,
-        }),
-      });
+      // 1. Immediately persist room in Firestore with authoritative user.uid as ownerId
+      const initialFiles = getDefaultProjectFiles(finalRoomId);
+      await createRoomInFirestore(finalRoomId, finalRoomName, user.uid, initialFiles);
 
-      const data = await res.json().catch(() => null);
-      if (!res.ok || !data?.success) {
-        throw new Error(data?.message || 'Could not initialize room on server');
+      // 2. Also initialize backend server state if reachable
+      try {
+        const idToken = await user.getIdToken();
+        await fetch('/api/room/create', {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({ 
+            roomId: finalRoomId, 
+            roomName: finalRoomName,
+            hostId: user.uid,
+          }),
+        });
+      } catch (serverErr) {
+        // Backend failure in serverless or offline mode is non-fatal since Firestore is source of truth
+        console.warn('Realtime server registration note:', serverErr);
       }
 
-      const createdRoom = data.room || { roomId: finalRoomId, roomName: finalRoomName, hostId: user.uid };
-
       localStorage.setItem('collab_username', finalUser);
-      localStorage.setItem(`room_${createdRoom.roomId}_name`, createdRoom.roomName);
+      localStorage.setItem(`room_${finalRoomId}_name`, finalRoomName);
       // Authorize tab session for direct entry
-      sessionStorage.setItem(`cd_joined_${createdRoom.roomId}`, 'true');
+      sessionStorage.setItem(`cd_joined_${finalRoomId}`, 'true');
 
-      // Sync Firestore room document with host ID
-      await saveRoomToFirestore(createdRoom.roomId, createdRoom.roomName, user.uid, '');
+      toast.success(`Created workspace: ${finalRoomName}`);
 
-      toast.success(`Created workspace: ${createdRoom.roomName}`);
-
-      navigate(`/room/${createdRoom.roomId}`, {
+      navigate(`/room/${finalRoomId}`, {
         state: {
           username: finalUser,
-          roomname: createdRoom.roomName,
+          roomname: finalRoomName,
           isHost: true,
         },
       });
     } catch (err: any) {
-      toast.error(err?.message || 'Failed to create workspace room');
+      console.error('Room creation error:', err);
+      toast.error(err?.message || 'Failed to create workspace room document in Firestore.');
     } finally {
       setIsValidating(false);
     }
@@ -157,22 +161,75 @@ export const HomePage: FC = () => {
       return;
     }
 
+    if (!user) {
+      toast.error('Authentication required. Please sign in to join a workspace.');
+      navigate('/login');
+      return;
+    }
+
     setIsValidating(true);
     try {
-      const res = await fetch(`/api/room/validate/${encodeURIComponent(cleanRoomId)}`);
-      const data = await res.json();
+      const idToken = await user.getIdToken();
+      let roomDocData: any = null;
+      let isValid = false;
+      let roomOwnerId = '';
+      let roomNameResolved = 'Collaborative Workspace';
 
-      if (!data.valid) {
-        if (data.reason === 'closed') {
-          toast.error('This room is no longer available.');
-        } else if (data.reason === 'not_found') {
-          toast.error('Room not found');
-        } else if (data.reason === 'permission_denied') {
-          toast.error("You don't have permission to join this room.");
-        } else {
-          toast.error(data.message || 'Room not found');
+      // 1. Try querying backend /api/room/validate
+      try {
+        const res = await fetch(`/api/room/validate/${encodeURIComponent(cleanRoomId)}`, {
+          headers: {
+            'Authorization': `Bearer ${idToken}`,
+          },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.code === 'ROOM_NOT_FOUND') {
+            toast.error('Room not found');
+            return;
+          }
+          if (data.code === 'ROOM_CLOSED' || data.reason === 'closed') {
+            toast.error('This room has been closed.');
+            return;
+          }
+          if (data.code === 'UNAUTHENTICATED') {
+            toast.error('Please sign in to join this room.');
+            return;
+          }
+          if (data.valid) {
+            isValid = true;
+            roomOwnerId = data.ownerId || '';
+            roomNameResolved = data.name || data.roomname || 'Collaborative Workspace';
+          }
         }
-        return;
+      } catch (apiErr) {
+        console.warn('API validate check fallback to Firestore:', apiErr);
+      }
+
+      // 2. Authoritative check directly via Firestore if API did not validate
+      if (!isValid) {
+        const roomRef = doc(db, 'rooms', cleanRoomId);
+        const roomSnap = await getDoc(roomRef);
+
+        if (!roomSnap.exists()) {
+          toast.error('Room not found');
+          return;
+        }
+
+        const data = roomSnap.data();
+        if (data.status === 'closed') {
+          toast.error('This room has been closed.');
+          return;
+        }
+
+        if (data.status && data.status !== 'active') {
+          toast.error('This room is not active.');
+          return;
+        }
+
+        isValid = true;
+        roomOwnerId = data.ownerId || data.hostId || '';
+        roomNameResolved = data.name || 'Collaborative Workspace';
       }
 
       const finalUser = username.trim() || user?.displayName || user?.email?.split('@')[0] || 'Developer';
@@ -180,14 +237,18 @@ export const HomePage: FC = () => {
       // Authorize tab session for this specific room
       sessionStorage.setItem(`cd_joined_${cleanRoomId}`, 'true');
 
+      // The Firebase UID is the persistent source of truth for host ownership
+      const isOwner = Boolean(user?.uid && roomOwnerId && user.uid === roomOwnerId);
+
       navigate(`/room/${cleanRoomId}`, {
         state: {
           username: finalUser,
-          roomname: data.roomname || 'Collaborative Workspace',
-          isHost: false,
+          roomname: roomNameResolved,
+          isHost: isOwner,
         },
       });
-    } catch (err) {
+    } catch (err: any) {
+      console.error('Room validation error:', err);
       toast.error('Failed to validate room. Please check your network and try again.');
     } finally {
       setIsValidating(false);

@@ -67,6 +67,8 @@ async function saveRoomToFirestore(projectId, roomId, roomName, hostId, idToken)
         name: { stringValue: roomName },
         hostId: { stringValue: hostId },
         ownerId: { stringValue: hostId },
+        createdBy: { stringValue: hostId },
+        status: { stringValue: 'active' },
         createdAt: { stringValue: now },
         updatedAt: { stringValue: now },
       },

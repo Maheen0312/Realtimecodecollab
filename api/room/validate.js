@@ -33,34 +33,90 @@ export default async function handler(req, res) {
   const targetId = (roomId || '').trim();
 
   if (!targetId) {
-    return res.status(400).json({ valid: false, message: 'Room ID is required' });
+    return res.status(400).json({ 
+      valid: false, 
+      code: 'BAD_REQUEST',
+      message: 'Room ID is required.' 
+    });
+  }
+
+  // Extract optional Bearer token
+  const authHeader = req.headers.authorization || req.headers.Authorization || '';
+  let idToken = '';
+  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    idToken = authHeader.substring(7).trim();
   }
 
   const { projectId } = getFirebaseConfig();
 
-  // If projectId is present, verify in Firestore
+  // If projectId is configured, verify against Firestore document
   if (projectId) {
     try {
       const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/rooms/${encodeURIComponent(targetId)}`;
-      const checkRes = await fetch(url);
+      const headers = {};
+      if (idToken) {
+        headers['Authorization'] = `Bearer ${idToken}`;
+      }
+
+      const checkRes = await fetch(url, { headers });
+      
+      if (checkRes.status === 404) {
+        return res.status(200).json({
+          valid: false,
+          code: 'ROOM_NOT_FOUND',
+          message: 'Room does not exist.',
+        });
+      }
+
+      if (checkRes.status === 401 || checkRes.status === 403) {
+        // If unauthenticated access is rejected by Firestore security rules
+        if (!idToken) {
+          return res.status(200).json({
+            valid: false,
+            code: 'UNAUTHENTICATED',
+            message: 'User authentication required to join this room.',
+          });
+        }
+      }
+
       if (checkRes.status === 200) {
         const docData = await checkRes.json();
-        const roomName = docData.fields?.name?.stringValue || 'CODE DEATH Workspace';
+        const fields = docData.fields || {};
+        const status = fields.status?.stringValue || 'active';
+        const name = fields.name?.stringValue || 'CODE DEATH Workspace';
+        const ownerId = fields.ownerId?.stringValue || fields.hostId?.stringValue || fields.createdBy?.stringValue || '';
+
+        if (status === 'closed' || status !== 'active') {
+          return res.status(200).json({
+            valid: false,
+            code: 'ROOM_CLOSED',
+            message: 'This room has been closed.',
+          });
+        }
+
         return res.status(200).json({
           valid: true,
-          roomname: roomName,
+          roomId: targetId,
+          name,
+          roomname: name,
+          ownerId,
+          status: 'active',
           isReadOnly: false,
         });
       }
-    } catch {
-      // Fallback
+    } catch (err) {
+      console.warn('Firestore validation lookup error:', err);
     }
   }
 
-  // Allow standard room IDs
+  // Fallback if network was unable to query Firestore REST API
   return res.status(200).json({
     valid: true,
+    roomId: targetId,
+    name: 'CODE DEATH Workspace',
     roomname: 'CODE DEATH Workspace',
+    ownerId: '',
+    status: 'active',
     isReadOnly: false,
   });
 }
