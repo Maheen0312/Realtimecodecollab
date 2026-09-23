@@ -1,0 +1,82 @@
+{
+  "entities": {
+    "users": {
+      "title": "User Profile",
+      "description": "Registered user account profile in CodeCollab",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "email", "displayName", "createdAt"]
+    },
+    "rooms": {
+      "title": "Collaborative Room",
+      "description": "A collaborative coding room/project workspace",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "language": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "isPublic": { "type": "boolean" }
+      },
+      "required": ["id", "name", "ownerId", "createdAt"]
+    },
+    "files": {
+      "title": "Project File",
+      "description": "A file or directory inside a collaborative room project",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "roomId": { "type": "string" },
+        "name": { "type": "string" },
+        "path": { "type": "string" },
+        "content": { "type": "string" },
+        "language": { "type": "string" },
+        "isFolder": { "type": "boolean" },
+        "parentPath": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "roomId", "name", "path", "isFolder"]
+    },
+    "messages": {
+      "title": "Room Chat Message",
+      "description": "A chat message posted to a room conversation",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "roomId": { "type": "string" },
+        "senderId": { "type": "string" },
+        "senderName": { "type": "string" },
+        "senderColor": { "type": "string" },
+        "text": { "type": "string" },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["id", "roomId", "senderId", "senderName", "text", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "users",
+      "description": "User profile document indexed by Firebase Auth UID"
+    },
+    "/rooms/{roomId}": {
+      "schema": "rooms",
+      "description": "Collaborative room workspace"
+    },
+    "/rooms/{roomId}/files/{fileId}": {
+      "schema": "files",
+      "description": "File or folder within the room project workspace"
+    },
+    "/rooms/{roomId}/messages/{messageId}": {
+      "schema": "messages",
+      "description": "Chat messages sent within the room"
+    }
+  }
+}

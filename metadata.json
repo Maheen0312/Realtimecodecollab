@@ -1,0 +1,12 @@
+{
+  "name": "CODE DEATH",
+  "description": "CODE DEATH - Next-Generation Realtime Collaborative Developer IDE & Pair Programming Workspace with live synchronized code editing, chat, terminal, and AI assistance.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
