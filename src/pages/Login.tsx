@@ -1,8 +1,8 @@
-import React, { useState, FC, FormEvent } from 'react';
+import React, { useState, useEffect, FC, FormEvent } from 'react';
 import { useNavigate, useLocation, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { CodeDeathLogo } from '../components/CodeDeathLogo';
-import { Toaster } from 'react-hot-toast';
+import toast, { Toaster } from 'react-hot-toast';
 import { 
   LogIn, 
   ArrowRight, 
@@ -14,14 +14,17 @@ import {
   Terminal, 
   ShieldCheck,
   CheckCircle2,
-  AlertCircle
+  AlertCircle,
+  Copy,
+  Link2,
+  X
 } from 'lucide-react';
 import { motion } from 'motion/react';
 
 export const LoginPage: FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const { loginWithEmail, loginWithGoogle, sendResetEmail } = useAuth();
+  const { loginWithEmail, loginWithGoogle, sendResetEmail, pendingLinkCredential, clearPendingLinkCredential } = useAuth();
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -32,6 +35,14 @@ export const LoginPage: FC = () => {
   const [resetEmail, setResetEmail] = useState('');
   const [resetSending, setResetSending] = useState(false);
   const [resetSent, setResetSent] = useState(false);
+  const [authError, setAuthError] = useState<any>(null);
+
+  // Auto-fill email if user tried to sign in with Google but account exists
+  useEffect(() => {
+    if (pendingLinkCredential?.email) {
+      setEmail(pendingLinkCredential.email);
+    }
+  }, [pendingLinkCredential]);
 
   // Protected route resolution: room links must route to dashboard with room prefilled, never directly into the room
   const getPostAuthRedirect = (): string => {
@@ -64,11 +75,12 @@ export const LoginPage: FC = () => {
     if (!email.trim() || !password) return;
 
     setIsSubmitting(true);
+    setAuthError(null);
     try {
       await loginWithEmail(email, password);
       navigate(getPostAuthRedirect(), { replace: true });
-    } catch {
-      // Error toast is handled in AuthContext
+    } catch (err: any) {
+      setAuthError(err);
     } finally {
       setIsSubmitting(false);
     }
@@ -76,11 +88,12 @@ export const LoginPage: FC = () => {
 
   const handleGoogleLogin = async () => {
     setIsGoogleLoading(true);
+    setAuthError(null);
     try {
       await loginWithGoogle();
       navigate(getPostAuthRedirect(), { replace: true });
-    } catch {
-      // Handled in AuthContext
+    } catch (err: any) {
+      setAuthError(err);
     } finally {
       setIsGoogleLoading(false);
     }
@@ -186,6 +199,26 @@ export const LoginPage: FC = () => {
                 Sign in to your CODE DEATH developer workspace.
               </p>
             </div>
+
+            {/* Account Linking Notice */}
+            {pendingLinkCredential && (
+              <div className="p-3.5 rounded-xl bg-cyan-950/40 border border-cyan-500/40 text-cyan-200 text-xs flex items-start gap-2.5 animate-fadeIn">
+                <Link2 className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
+                <div className="flex-1 space-y-1">
+                  <div className="font-semibold text-cyan-300">Link Google Account</div>
+                  <p className="text-slate-300 leading-relaxed text-[11px]">
+                    An account already exists for <strong className="text-white">{pendingLinkCredential.email}</strong>. Enter your password below to sign in and securely link your Google account.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={clearPendingLinkCredential}
+                  className="text-slate-400 hover:text-slate-200 p-0.5 rounded cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
 
             {/* Email/Password Form */}
             <form onSubmit={handleSubmit} className="space-y-4">
@@ -306,6 +339,38 @@ export const LoginPage: FC = () => {
               )}
               <span>Continue with Google</span>
             </button>
+
+            {/* Unauthorized Domain Diagnostic Helper */}
+            {authError && authError.code === 'auth/unauthorized-domain' && (
+              <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs space-y-2 text-left animate-fadeIn">
+                <div className="flex items-center gap-2 font-bold text-amber-300">
+                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>Domain Authorization Needed</span>
+                </div>
+                <p className="text-slate-300 text-[11px] leading-relaxed">
+                  Firebase requires this deployment hostname to be authorized:
+                </p>
+                <div className="flex items-center justify-between bg-slate-950 px-2.5 py-1.5 rounded-lg border border-slate-800 font-mono text-cyan-300 text-xs">
+                  <span className="truncate pr-2">{typeof window !== 'undefined' ? window.location.hostname : ''}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(window.location.hostname);
+                      toast.success('Hostname copied to clipboard!');
+                    }}
+                    className="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 text-[10px] font-bold flex items-center gap-1 shrink-0 cursor-pointer"
+                  >
+                    <Copy className="w-3 h-3" />
+                    <span>Copy</span>
+                  </button>
+                </div>
+                <div className="text-[11px] text-slate-400 space-y-0.5 pt-0.5">
+                  <p>1. Open <strong>Firebase Console → Authentication → Settings</strong></p>
+                  <p>2. Scroll to <strong>Authorized domains</strong> → click <strong>Add domain</strong></p>
+                  <p>3. Paste <code>{typeof window !== 'undefined' ? window.location.hostname : ''}</code> & click Save</p>
+                </div>
+              </div>
+            )}
 
             {/* Signup Redirect Footer */}
             <div className="pt-1 text-center text-xs text-slate-400">

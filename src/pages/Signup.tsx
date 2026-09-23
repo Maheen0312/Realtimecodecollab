@@ -2,8 +2,7 @@ import React, { useState, FC, FormEvent } from 'react';
 import { useNavigate, useLocation, Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { CodeDeathLogo } from '../components/CodeDeathLogo';
-import { Toaster } from 'react-hot-toast';
-import toast from 'react-hot-toast';
+import toast, { Toaster } from 'react-hot-toast';
 import { 
   UserPlus, 
   ArrowRight, 
@@ -13,7 +12,8 @@ import {
   Eye, 
   EyeOff, 
   ShieldCheck, 
-  AlertCircle 
+  AlertCircle,
+  Copy
 } from 'lucide-react';
 import { motion } from 'motion/react';
 
@@ -29,6 +29,7 @@ export const SignupPage: FC = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isGoogleLoading, setIsGoogleLoading] = useState(false);
+  const [authError, setAuthError] = useState<any>(null);
 
   const getPostAuthRedirect = (): string => {
     const from = (location.state as any)?.from;
@@ -76,11 +77,12 @@ export const SignupPage: FC = () => {
     }
 
     setIsSubmitting(true);
+    setAuthError(null);
     try {
       await signupWithEmail(name, email, password);
       navigate(getPostAuthRedirect(), { replace: true });
-    } catch {
-      // Handled in AuthContext
+    } catch (err: any) {
+      setAuthError(err);
     } finally {
       setIsSubmitting(false);
     }
@@ -88,11 +90,17 @@ export const SignupPage: FC = () => {
 
   const handleGoogleSignup = async () => {
     setIsGoogleLoading(true);
+    setAuthError(null);
     try {
       await loginWithGoogle();
       navigate(getPostAuthRedirect(), { replace: true });
-    } catch {
-      // Handled in AuthContext
+    } catch (err: any) {
+      if (err.code === 'auth/account-exists-with-different-credential') {
+        // Redirect to login where password can be entered to link the account
+        navigate('/login', { replace: true });
+      } else {
+        setAuthError(err);
+      }
     } finally {
       setIsGoogleLoading(false);
     }
@@ -333,6 +341,38 @@ export const SignupPage: FC = () => {
               )}
               <span>Sign up with Google</span>
             </button>
+
+            {/* Unauthorized Domain Diagnostic Helper */}
+            {authError && authError.code === 'auth/unauthorized-domain' && (
+              <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs space-y-2 text-left animate-fadeIn">
+                <div className="flex items-center gap-2 font-bold text-amber-300">
+                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>Domain Authorization Needed</span>
+                </div>
+                <p className="text-slate-300 text-[11px] leading-relaxed">
+                  Firebase requires this deployment hostname to be authorized:
+                </p>
+                <div className="flex items-center justify-between bg-slate-950 px-2.5 py-1.5 rounded-lg border border-slate-800 font-mono text-cyan-300 text-xs">
+                  <span className="truncate pr-2">{typeof window !== 'undefined' ? window.location.hostname : ''}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(window.location.hostname);
+                      toast.success('Hostname copied to clipboard!');
+                    }}
+                    className="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 text-[10px] font-bold flex items-center gap-1 shrink-0 cursor-pointer"
+                  >
+                    <Copy className="w-3 h-3" />
+                    <span>Copy</span>
+                  </button>
+                </div>
+                <div className="text-[11px] text-slate-400 space-y-0.5 pt-0.5">
+                  <p>1. Open <strong>Firebase Console → Authentication → Settings</strong></p>
+                  <p>2. Scroll to <strong>Authorized domains</strong> → click <strong>Add domain</strong></p>
+                  <p>3. Paste <code>{typeof window !== 'undefined' ? window.location.hostname : ''}</code> & click Save</p>
+                </div>
+              </div>
+            )}
 
             {/* Login Redirect */}
             <div className="pt-1 text-center text-xs text-slate-400">

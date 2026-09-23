@@ -275,6 +275,7 @@ export const RoomPage: FC = () => {
       socket.emit(ACTIONS.JOIN, {
         roomId,
         username,
+        userId: user?.uid,
       });
     });
 
