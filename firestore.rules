@@ -36,6 +36,12 @@ service cloud.firestore {
         allow create: if isAuthenticated() && request.resource.data.senderId == request.auth.uid;
         allow update, delete: if isAuthenticated() && (resource.data.senderId == request.auth.uid || request.auth.uid == get(/databases/$(database)/documents/rooms/$(roomId)).data.ownerId);
       }
+
+      // Room participants subcollection
+      match /participants/{participantId} {
+        allow read: if isAuthenticated();
+        allow write: if isAuthenticated();
+      }
     }
   }
 }

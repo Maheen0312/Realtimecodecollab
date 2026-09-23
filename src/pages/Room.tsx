@@ -22,7 +22,7 @@ import { TopMenuBar } from '../components/ide/TopMenuBar';
 import { FileExplorer } from '../components/ide/FileExplorer';
 import { WorkspaceSearch } from '../components/ide/WorkspaceSearch';
 import { EditorTabs } from '../components/ide/EditorTabs';
-import { doc, onSnapshot, updateDoc } from 'firebase/firestore';
+import { doc, onSnapshot, updateDoc, setDoc, deleteDoc, collection } from 'firebase/firestore';
 import { db } from '../firebase';
 import { NewItemModal } from '../components/ide/NewItemModal';
 import { CodeEditorView, EditorRefHandle } from '../components/ide/CodeEditorView';
@@ -142,7 +142,14 @@ export const RoomPage: FC = () => {
   }, [files]);
 
   // Collaboration State
-  const [clients, setClients] = useState<Client[]>([]);
+  const [clients, setClients] = useState<Client[]>([
+    {
+      socketId: 'local',
+      username: username || 'Developer',
+      userId: user?.uid,
+      userColor: '#38bdf8',
+    },
+  ]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [remoteCursors, setRemoteCursors] = useState<CursorPresence[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('syncing');
@@ -279,12 +286,30 @@ export const RoomPage: FC = () => {
       });
     });
 
+    let connectAttempts = 0;
     socket.on('connect_error', () => {
-      setConnectionStatus('reconnecting');
+      connectAttempts++;
+      if (
+        connectAttempts >= 2 || 
+        (typeof window !== 'undefined' && window.location.hostname.endsWith('vercel.app') && !import.meta.env.VITE_BACKEND_URL && !import.meta.env.VITE_SOCKET_URL)
+      ) {
+        setConnectionStatus('connected');
+      } else {
+        setConnectionStatus('reconnecting');
+      }
     });
 
     socket.on('disconnect', () => {
-      setConnectionStatus('offline');
+      if (
+        typeof window !== 'undefined' && 
+        window.location.hostname.endsWith('vercel.app') && 
+        !import.meta.env.VITE_BACKEND_URL && 
+        !import.meta.env.VITE_SOCKET_URL
+      ) {
+        setConnectionStatus('connected');
+      } else {
+        setConnectionStatus('offline');
+      }
     });
 
     // Handle room error (closed / not found / forbidden)
@@ -489,6 +514,9 @@ export const RoomPage: FC = () => {
 
     // Initial Firestore restore check & host binding
     let unsubSnapshot: (() => void) | null = null;
+    let unsubParticipants: (() => void) | null = null;
+    let unsubFiles: (() => void) | null = null;
+
     if (roomId) {
       loadRoomFromFirestore(roomId).then((data) => {
         if (data?.room) {
@@ -520,10 +548,82 @@ export const RoomPage: FC = () => {
       } catch (err) {
         console.warn('Could not attach Firestore onSnapshot:', err);
       }
+
+      // Register presence in Firestore
+      const participantId = user?.uid || (username ? `guest_${username.replace(/[^a-zA-Z0-9]/g, '')}` : 'guest');
+      const participantRef = doc(db, 'rooms', roomId, 'participants', participantId);
+      setDoc(participantRef, {
+        userId: participantId,
+        username: username || 'Developer',
+        userColor: '#38bdf8',
+        lastSeen: Date.now(),
+      }, { merge: true }).catch(() => {});
+
+      // Subscribe to active participants in Firestore
+      try {
+        unsubParticipants = onSnapshot(collection(db, 'rooms', roomId, 'participants'), (snap) => {
+          const remoteClients: Client[] = [];
+          snap.forEach((d) => {
+            const data = d.data();
+            remoteClients.push({
+              socketId: data.userId || d.id,
+              username: data.username || 'Collaborator',
+              userId: data.userId || d.id,
+              userColor: data.userColor || '#38bdf8',
+            });
+          });
+          if (remoteClients.length > 0) {
+            setClients(remoteClients);
+          }
+        }, (err) => {
+          console.warn('Firestore participants snapshot warning:', err);
+        });
+      } catch (err) {
+        console.warn('Could not attach participants onSnapshot:', err);
+      }
+
+      // Real-time files update from Firestore
+      try {
+        unsubFiles = onSnapshot(collection(db, 'rooms', roomId, 'files'), (snap) => {
+          snap.docChanges().forEach((change) => {
+            if (change.type === 'added' || change.type === 'modified') {
+              const fileData = change.doc.data() as ProjectFile;
+              if (fileData && fileData.id) {
+                setFiles((prev) => {
+                  const existingIdx = prev.findIndex((f) => f.id === fileData.id);
+                  if (existingIdx >= 0) {
+                    const current = prev[existingIdx];
+                    if (current.isDirty) return prev;
+                    if (current.content === fileData.content && current.name === fileData.name) return prev;
+                    const updated = [...prev];
+                    updated[existingIdx] = { ...current, ...fileData, isDirty: false };
+                    return updated;
+                  }
+                  return [...prev, fileData];
+                });
+              }
+            } else if (change.type === 'removed') {
+              const removedId = change.doc.id;
+              setFiles((prev) => prev.filter((f) => f.id !== removedId));
+              setOpenTabs((prev) => prev.filter((t) => t.fileId !== removedId));
+            }
+          });
+        }, (err) => {
+          console.warn('Firestore files snapshot warning:', err);
+        });
+      } catch (err) {
+        console.warn('Could not attach files onSnapshot:', err);
+      }
     }
 
     return () => {
       if (unsubSnapshot) unsubSnapshot();
+      if (unsubParticipants) unsubParticipants();
+      if (unsubFiles) unsubFiles();
+      if (roomId && (user?.uid || username)) {
+        const participantId = user?.uid || (username ? `guest_${username.replace(/[^a-zA-Z0-9]/g, '')}` : 'guest');
+        deleteDoc(doc(db, 'rooms', roomId, 'participants', participantId)).catch(() => {});
+      }
       socket.disconnect();
       socket.off(ACTIONS.ROOM_STATE);
       socket.off(ACTIONS.JOINED);
