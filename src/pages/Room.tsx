@@ -52,6 +52,7 @@ import {
   saveMessageToFirestore,
   replaceWorkspaceInFirestore,
   closeRoomInFirestore,
+  transferRoomOwnershipInFirestore,
 } from '../services/firestoreService';
 
 import { 
@@ -503,16 +504,35 @@ export const RoomPage: FC = () => {
 
     // Room management & permissions events
     socket.on(ACTIONS.KICKED_FROM_ROOM, ({ reason }: { reason?: string }) => {
+      if (roomId) {
+        sessionStorage.removeItem(`cd_joined_${roomId}`);
+      }
       toast.error(reason || 'You have been removed from this room by the host.');
-      navigate('/');
+      navigate('/dashboard', { replace: true });
+    });
+
+    socket.on('user-kicked', ({ targetUsername }: { targetUsername?: string }) => {
+      toast(`${targetUsername || 'A participant'} was removed from the session`, { icon: '🚪' });
+    });
+
+    socket.on('room-participants', (updatedClients: Client[]) => {
+      if (Array.isArray(updatedClients) && updatedClients.length > 0) {
+        setClients(updatedClients);
+      }
     });
 
     socket.on(ACTIONS.ROOM_DELETED, ({ reason }: { reason?: string }) => {
+      if (roomId) {
+        sessionStorage.removeItem(`cd_joined_${roomId}`);
+      }
       toast.error(reason || 'The room has been deleted by the host.');
-      navigate('/');
+      navigate('/dashboard', { replace: true });
     });
 
-    socket.on(ACTIONS.HOST_TRANSFERRED, ({ newHostUsername }: { newHostUsername?: string }) => {
+    socket.on(ACTIONS.HOST_TRANSFERRED, ({ newHostUserId, newHostUsername }: { newHostUserId?: string; newHostUsername?: string }) => {
+      if (newHostUserId) {
+        setRoomHostId(newHostUserId);
+      }
       toast.success(`${newHostUsername || 'A participant'} is now the room host.`, { icon: '👑' });
     });
 
@@ -545,9 +565,15 @@ export const RoomPage: FC = () => {
         unsubSnapshot = onSnapshot(doc(db, 'rooms', roomId), (snap) => {
           if (snap.exists()) {
             const rData = snap.data();
-            const hId = rData.hostId || rData.ownerId || null;
-            setRoomHostId(hId);
+            const hId = rData.ownerId || rData.hostId || null;
+            if (hId) {
+              setRoomHostId(hId);
+            }
             if (rData.name) setRoomname(rData.name);
+            if (rData.status === 'closed') {
+              toast.error('This room has been closed.');
+              navigate('/dashboard', { replace: true });
+            }
           }
           setIsRoomLoading(false);
         }, (err) => {
@@ -568,22 +594,28 @@ export const RoomPage: FC = () => {
         lastSeen: Date.now(),
       }, { merge: true }).catch(() => {});
 
-      // Subscribe to active participants in Firestore
+      // Subscribe to active participants in Firestore as secondary presence fallback
       try {
         unsubParticipants = onSnapshot(collection(db, 'rooms', roomId, 'participants'), (snap) => {
-          const remoteClients: Client[] = [];
-          snap.forEach((d) => {
-            const data = d.data();
-            remoteClients.push({
-              socketId: data.userId || d.id,
-              username: data.username || 'Collaborator',
-              userId: data.userId || d.id,
-              userColor: data.userColor || '#38bdf8',
+          setClients((prevClients) => {
+            // If Socket.IO already has active live clients, preserve authoritative Socket.IO state
+            if (prevClients.some((c) => c.socketId && c.socketId !== 'local' && !c.socketId.startsWith('guest_'))) {
+              return prevClients;
+            }
+            const remoteClients: Client[] = [];
+            snap.forEach((d) => {
+              const data = d.data();
+              const uId = data.userId || d.id;
+              remoteClients.push({
+                socketId: uId,
+                username: data.username || 'Collaborator',
+                userId: uId,
+                userColor: data.userColor || '#38bdf8',
+                isHost: Boolean(roomHostId && uId === roomHostId),
+              });
             });
+            return remoteClients.length > 0 ? remoteClients : prevClients;
           });
-          if (remoteClients.length > 0) {
-            setClients(remoteClients);
-          }
         }, (err) => {
           console.warn('Firestore participants snapshot warning:', err);
         });
@@ -648,6 +680,8 @@ export const RoomPage: FC = () => {
       socket.off(ACTIONS.CHAT_MESSAGE);
       socket.off(ACTIONS.CODE_OUTPUT);
       socket.off(ACTIONS.KICKED_FROM_ROOM);
+      socket.off('user-kicked');
+      socket.off('room-participants');
       socket.off(ACTIONS.ROOM_DELETED);
       socket.off(ACTIONS.HOST_TRANSFERRED);
       socket.off(ACTIONS.ROOM_PERMISSIONS_UPDATED);
@@ -1377,19 +1411,46 @@ export const RoomPage: FC = () => {
   }, [roomId]);
 
   // Host operations
-  const handleKickUser = useCallback((targetSocketId: string, targetUsername: string) => {
+  const handleKickUser = useCallback((targetSocketId: string, targetUsername: string, targetUserId?: string) => {
     if (socketRef.current && roomId) {
-      socketRef.current.emit(ACTIONS.KICK_USER, { roomId, targetSocketId });
-      toast.success(`Removed ${targetUsername} from session.`);
+      socketRef.current.emit(ACTIONS.KICK_USER, { 
+        roomId, 
+        targetSocketId, 
+        targetUserId,
+        targetUsername 
+      });
+      // Optimistically filter from client list
+      setClients((prev) => prev.filter((c) => {
+        if (targetUserId && c.userId === targetUserId) return false;
+        if (targetSocketId && c.socketId === targetSocketId) return false;
+        return true;
+      }));
+      toast.success(`Removed ${targetUsername} from session.`, { icon: '👋' });
     }
   }, [roomId]);
 
-  const handleTransferHost = useCallback((targetSocketId: string, targetUsername: string) => {
-    if (socketRef.current && roomId) {
-      socketRef.current.emit(ACTIONS.TRANSFER_HOST, { roomId, targetSocketId });
-      toast.success(`Transferred host privileges to ${targetUsername}.`);
+  const handleTransferHost = useCallback(async (targetSocketId: string, targetUsername: string, targetUserId?: string) => {
+    if (!roomId) return;
+    try {
+      if (socketRef.current) {
+        socketRef.current.emit(ACTIONS.TRANSFER_HOST, { 
+          roomId, 
+          targetSocketId, 
+          targetUserId,
+          targetUsername 
+        });
+      }
+
+      if (user?.uid && targetUserId) {
+        await transferRoomOwnershipInFirestore(roomId, user.uid, targetUserId);
+        setRoomHostId(targetUserId);
+      }
+      toast.success(`Transferred host privileges to ${targetUsername}.`, { icon: '👑' });
+    } catch (err: any) {
+      console.warn('Transfer host operation note:', err);
+      toast.error(err?.message || 'Failed to transfer host privileges.');
     }
-  }, [roomId]);
+  }, [roomId, user?.uid]);
 
   const handleTogglePermissions = useCallback((newReadOnly: boolean) => {
     if (socketRef.current && roomId) {
@@ -1857,6 +1918,8 @@ export const RoomPage: FC = () => {
                 isHost={isHost}
                 roomId={roomId || ''}
                 files={files}
+                roomHostId={roomHostId}
+                currentUserUid={user?.uid}
                 onKickUser={handleKickUser}
                 onTransferHost={handleTransferHost}
                 onTogglePermissions={handleTogglePermissions}

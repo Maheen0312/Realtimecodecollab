@@ -1396,11 +1396,12 @@ interface StoredRoom {
   passcode?: string;
   files: Map<string, ServerProjectFile>;
   participants: Map<string, { username: string; userColor: string; isHost: boolean; activeFileId?: string; userId?: string }>;
+  kickedUsers?: Set<string>;
 }
 
 const users = new Map<string, StoredUser>(); // email -> user
 const rooms = new Map<string, StoredRoom>(); // roomId -> room
-const socketUserMap = new Map<string, { username: string; userColor: string; roomId?: string; activeFileId?: string }>();
+const socketUserMap = new Map<string, { username: string; userColor: string; roomId?: string; activeFileId?: string; userId?: string; idToken?: string }>();
 
 export interface CallParticipant {
   socketId: string;
@@ -1526,6 +1527,42 @@ async function loadRoomFromFirestoreOnServer(roomId: string, idToken?: string): 
     console.warn("loadRoomFromFirestoreOnServer error:", err);
   }
   return null;
+}
+
+async function updateRoomOwnerInFirestoreOnServer(
+  roomId: string, 
+  newOwnerId: string, 
+  idToken?: string
+): Promise<boolean> {
+  const { projectId } = getFirebaseServerConfig();
+  if (!projectId || !roomId || !newOwnerId) return false;
+
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/rooms/${encodeURIComponent(roomId)}?updateMask.fieldPaths=ownerId&updateMask.fieldPaths=hostId&updateMask.fieldPaths=updatedAt`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (idToken) {
+      headers["Authorization"] = `Bearer ${idToken}`;
+    }
+
+    const now = new Date().toISOString();
+    const res = await fetch(url, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({
+        fields: {
+          ownerId: { stringValue: newOwnerId },
+          hostId: { stringValue: newOwnerId },
+          updatedAt: { stringValue: now },
+        },
+      }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn("Could not update room owner in Firestore from server:", err);
+    return false;
+  }
 }
 
 const USER_COLORS = [
@@ -2129,6 +2166,14 @@ async function startServer() {
 
       const room = getOrCreateRoom(roomId, firestoreData?.name || "Collaborative Workspace");
       
+      // Check if user has been kicked from this room
+      if (userId && room.kickedUsers && room.kickedUsers.has(userId)) {
+        socket.emit("kicked-from-room", {
+          reason: "You have been removed from this room by the host."
+        });
+        return;
+      }
+
       // Preserve persistent ownerId from Firestore
       if (firestoreData?.ownerId) {
         room.owner = firestoreData.ownerId;
@@ -2164,6 +2209,8 @@ async function startServer() {
         userColor: color,
         roomId,
         activeFileId: initialActive,
+        userId: userId || undefined,
+        idToken: idToken || undefined,
       });
 
       room.participants.set(socket.id, {
@@ -2174,6 +2221,11 @@ async function startServer() {
         activeFileId: initialActive,
       });
       room.lastUpdated = new Date().toISOString();
+
+      // Ensure all participants have authoritative isHost based on room.owner
+      for (const [, p] of room.participants.entries()) {
+        p.isHost = Boolean(room.owner && p.userId && p.userId === room.owner);
+      }
 
       socket.join(roomId);
 
@@ -2598,56 +2650,184 @@ async function startServer() {
     });
 
     // Room Host Management & Permissions
-    socket.on("kick-user", ({ roomId, targetSocketId }) => {
-      if (!roomId || !targetSocketId) return;
+    socket.on("kick-user", ({ roomId, targetUserId, targetSocketId }) => {
+      if (!roomId) return;
       const room = rooms.get(roomId);
-      const caller = room?.participants.get(socket.id);
-      if (caller?.isHost) {
-        const target = room?.participants.get(targetSocketId);
-        if (target) {
-          room.participants.delete(targetSocketId);
-          io.to(targetSocketId).emit("kicked-from-room", { reason: "You have been removed from the session by the host." });
-          io.to(roomId).emit("user-kicked", { targetUsername: target.username });
-          const clients = Array.from(room.participants.entries()).map(([sId, data]) => ({
-            socketId: sId,
-            username: data.username,
-            userColor: data.userColor,
-            isHost: data.isHost,
-            activeFileId: data.activeFileId,
-          }));
-          io.to(roomId).emit("room-participants", clients);
+      if (!room) return;
+
+      const callerUser = socketUserMap.get(socket.id);
+      const callerParticipant = room.participants.get(socket.id);
+      const callerUid = callerUser?.userId || callerParticipant?.userId;
+
+      // Authorize: Only the persistent room owner can kick users
+      if (!callerUid || !room.owner || callerUid !== room.owner) {
+        socket.emit("room-error", { 
+          code: "NOT_HOST",
+          message: "Only the current room host can remove participants." 
+        });
+        return;
+      }
+
+      if (targetUserId && targetUserId === callerUid) {
+        socket.emit("room-error", {
+          code: "CANNOT_KICK_SELF",
+          message: "You cannot kick yourself from the room."
+        });
+        return;
+      }
+
+      // Collect all socket IDs belonging to the target
+      const socketsToKick: string[] = [];
+      let targetUsername = "Collaborator";
+      let resolvedTargetUserId = targetUserId;
+
+      for (const [sId, p] of room.participants.entries()) {
+        if ((targetUserId && p.userId === targetUserId) || (targetSocketId && sId === targetSocketId)) {
+          socketsToKick.push(sId);
+          targetUsername = p.username || targetUsername;
+          if (!resolvedTargetUserId && p.userId) {
+            resolvedTargetUserId = p.userId;
+          }
         }
       }
+
+      if (socketsToKick.length === 0) {
+        return;
+      }
+
+      // Record in room's kicked list so they cannot immediately rejoin
+      if (!room.kickedUsers) {
+        room.kickedUsers = new Set<string>();
+      }
+      if (resolvedTargetUserId) {
+        room.kickedUsers.add(resolvedTargetUserId);
+      }
+
+      // Notify and disconnect target socket(s)
+      for (const sId of socketsToKick) {
+        room.participants.delete(sId);
+        const targetSocket = io.sockets.sockets.get(sId);
+        if (targetSocket) {
+          targetSocket.emit("kicked-from-room", { 
+            reason: "You were removed from this room by the host." 
+          });
+          targetSocket.leave(roomId);
+        }
+      }
+
+      // WebRTC clean up
+      const callPeers = callRooms.get(roomId);
+      if (callPeers) {
+        for (const sId of socketsToKick) {
+          if (callPeers.has(sId)) {
+            callPeers.delete(sId);
+            socket.to(roomId).emit("webrtc-user-left", { socketId: sId });
+          }
+        }
+      }
+
+      // Broadcast update to remaining participants
+      const clients = Array.from(room.participants.entries()).map(([sId, data]) => ({
+        socketId: sId,
+        userId: data.userId,
+        username: data.username,
+        userColor: data.userColor,
+        isHost: data.isHost,
+        activeFileId: data.activeFileId,
+      }));
+
+      io.to(roomId).emit("user-kicked", { targetUsername });
+      io.to(roomId).emit("room-participants", clients);
     });
 
-    socket.on("transfer-host", ({ roomId, targetSocketId }) => {
-      if (!roomId || !targetSocketId) return;
+    socket.on("transfer-host", async ({ roomId, targetUserId, targetSocketId }) => {
+      if (!roomId) return;
       const room = rooms.get(roomId);
-      const caller = room?.participants.get(socket.id);
-      if (caller?.isHost) {
-        const target = room?.participants.get(targetSocketId);
-        if (target) {
-          caller.isHost = false;
-          target.isHost = true;
-          room.owner = target.username;
-          const clients = Array.from(room.participants.entries()).map(([sId, data]) => ({
-            socketId: sId,
-            username: data.username,
-            userColor: data.userColor,
-            isHost: data.isHost,
-            activeFileId: data.activeFileId,
-          }));
-          io.to(roomId).emit("room-participants", clients);
-          io.to(roomId).emit("host-transferred", { newHostUsername: target.username });
+      if (!room) return;
+
+      const callerUser = socketUserMap.get(socket.id);
+      const callerParticipant = room.participants.get(socket.id);
+      const callerUid = callerUser?.userId || callerParticipant?.userId;
+
+      // Authorize: Only the persistent room owner can transfer host
+      if (!callerUid || !room.owner || callerUid !== room.owner) {
+        socket.emit("room-error", { 
+          code: "NOT_HOST",
+          message: "Only the current room host can transfer host privileges." 
+        });
+        return;
+      }
+
+      // Find target participant
+      let resolvedTargetSocketId = targetSocketId;
+      let targetEntry = resolvedTargetSocketId ? room.participants.get(resolvedTargetSocketId) : undefined;
+      if (!targetEntry && targetUserId) {
+        for (const [sId, p] of room.participants.entries()) {
+          if (p.userId === targetUserId) {
+            resolvedTargetSocketId = sId;
+            targetEntry = p;
+            break;
+          }
         }
       }
+
+      if (!targetEntry) {
+        socket.emit("room-error", {
+          code: "TARGET_NOT_MEMBER",
+          message: "Target user is not a current member of this room."
+        });
+        return;
+      }
+
+      const newOwnerUid = targetEntry.userId || targetUserId;
+      if (!newOwnerUid) {
+        socket.emit("room-error", {
+          code: "INVALID_TARGET",
+          message: "Target user does not have a valid user ID."
+        });
+        return;
+      }
+
+      // 1. Update in-memory room ownership
+      room.owner = newOwnerUid;
+      room.lastUpdated = new Date().toISOString();
+
+      // Authoritatively update isHost for all participants
+      for (const [, p] of room.participants.entries()) {
+        p.isHost = Boolean(p.userId && p.userId === newOwnerUid);
+      }
+
+      // 2. Persist new owner to Firestore
+      const idToken = callerUser?.idToken;
+      await updateRoomOwnerInFirestoreOnServer(roomId, newOwnerUid, idToken);
+
+      // 3. Build updated client list
+      const clients = Array.from(room.participants.entries()).map(([sId, data]) => ({
+        socketId: sId,
+        userId: data.userId,
+        username: data.username,
+        userColor: data.userColor,
+        isHost: data.isHost,
+        activeFileId: data.activeFileId,
+      }));
+
+      // 4. Broadcast to all users in the room
+      io.to(roomId).emit("room-participants", clients);
+      io.to(roomId).emit("host-transferred", {
+        newHostUserId: newOwnerUid,
+        newHostUsername: targetEntry.username,
+        previousHostUserId: callerUid,
+      });
     });
 
     socket.on("update-room-permissions", ({ roomId, isReadOnly, passcode }) => {
       if (!roomId) return;
       const room = rooms.get(roomId);
-      const caller = room?.participants.get(socket.id);
-      if (caller?.isHost) {
+      const callerUser = socketUserMap.get(socket.id);
+      const callerParticipant = room?.participants.get(socket.id);
+      const callerUid = callerUser?.userId || callerParticipant?.userId;
+
+      if (room && callerUid && room.owner && callerUid === room.owner) {
         if (typeof isReadOnly === "boolean") room.isReadOnly = isReadOnly;
         if (typeof passcode === "string") room.passcode = passcode;
         io.to(roomId).emit("room-permissions-updated", {
@@ -2660,8 +2840,11 @@ async function startServer() {
     socket.on("delete-room", ({ roomId }) => {
       if (!roomId) return;
       const room = rooms.get(roomId);
-      const caller = room?.participants.get(socket.id);
-      if (caller?.isHost) {
+      const callerUser = socketUserMap.get(socket.id);
+      const callerParticipant = room?.participants.get(socket.id);
+      const callerUid = callerUser?.userId || callerParticipant?.userId;
+
+      if (room && callerUid && room.owner && callerUid === room.owner) {
         closedRooms.add(roomId);
         io.to(roomId).emit("room-deleted", { reason: "The room was deleted by the host." });
         rooms.delete(roomId);
@@ -2688,8 +2871,14 @@ async function startServer() {
           username: user?.username,
         });
 
+        // Persistent room.owner must remain unchanged
+        for (const [, p] of room.participants.entries()) {
+          p.isHost = Boolean(room.owner && p.userId && p.userId === room.owner);
+        }
+
         const clients = Array.from(room.participants.entries()).map(([socketId, data]) => ({
           socketId,
+          userId: data.userId,
           username: data.username,
           userColor: data.userColor,
           isHost: data.isHost,
@@ -2828,6 +3017,17 @@ async function startServer() {
     let idToken = "";
     if (typeof authHeader === "string" && authHeader.startsWith("Bearer ")) {
       idToken = authHeader.substring(7).trim();
+    }
+
+    const userId = (req.query.userId as string) || "";
+    const activeRoom = rooms.get(roomId);
+    if (userId && activeRoom?.kickedUsers?.has(userId)) {
+      return res.json({
+        valid: false,
+        code: "USER_KICKED",
+        reason: "kicked",
+        message: "You were removed from this room by the host.",
+      });
     }
 
     // 1. Authoritative check in Firestore

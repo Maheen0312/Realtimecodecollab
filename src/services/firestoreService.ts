@@ -248,6 +248,32 @@ export async function saveMessageToFirestore(roomId: string, msg: ChatMessage) {
   }
 }
 
+export async function transferRoomOwnershipInFirestore(
+  roomId: string,
+  callerUid: string,
+  targetUid: string
+): Promise<boolean> {
+  try {
+    const roomRef = doc(db, 'rooms', roomId);
+    const snap = await getDoc(roomRef);
+    if (!snap.exists()) return false;
+    const data = snap.data();
+    if (data.ownerId !== callerUid && data.hostId !== callerUid) {
+      throw new Error('Only the current room host can transfer ownership.');
+    }
+    const now = new Date().toISOString();
+    await updateDoc(roomRef, {
+      ownerId: targetUid,
+      hostId: targetUid,
+      updatedAt: now,
+    });
+    return true;
+  } catch (err) {
+    console.warn('Transfer room ownership error:', err);
+    throw err;
+  }
+}
+
 export async function closeRoomInFirestore(roomId: string, callerUid: string): Promise<boolean> {
   try {
     const roomRef = doc(db, 'rooms', roomId);

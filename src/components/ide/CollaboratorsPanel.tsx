@@ -25,8 +25,10 @@ interface CollaboratorsPanelProps {
   isHost: boolean;
   roomId: string;
   files: ProjectFile[];
-  onKickUser?: (targetSocketId: string, targetUsername: string) => void;
-  onTransferHost?: (targetSocketId: string, targetUsername: string) => void;
+  roomHostId?: string | null;
+  currentUserUid?: string | null;
+  onKickUser?: (targetSocketId: string, targetUsername: string, targetUserId?: string) => void;
+  onTransferHost?: (targetSocketId: string, targetUsername: string, targetUserId?: string) => void;
   onTogglePermissions?: (isReadOnly: boolean) => void;
   onDeleteRoom?: () => void;
   onLeaveRoom: () => void;
@@ -39,6 +41,8 @@ export const CollaboratorsPanel: FC<CollaboratorsPanelProps> = ({
   isHost,
   roomId,
   files,
+  roomHostId,
+  currentUserUid,
   onKickUser,
   onTransferHost,
   onTogglePermissions,
@@ -102,14 +106,22 @@ export const CollaboratorsPanel: FC<CollaboratorsPanelProps> = ({
           </div>
         ) : (
           clients.map((client) => {
-            const isMe = client.username === currentUsername;
+            const isMe = Boolean(
+              (currentUserUid && client.userId && currentUserUid === client.userId) ||
+              (client.username === currentUsername)
+            );
+            const isClientHost = Boolean(
+              (client.userId && roomHostId && client.userId === roomHostId) ||
+              client.isHost ||
+              (isMe && isHost)
+            );
             const initial = (client.username || 'U').charAt(0).toUpperCase();
             const avatarBg = client.userColor || '#38bdf8';
             const activeFileName = getActiveFileName(client.activeFileId);
 
             return (
               <div
-                key={client.socketId}
+                key={client.socketId || client.userId || client.username}
                 className={`p-2.5 rounded-xl border transition-all ${
                   isMe
                     ? 'bg-slate-800/80 border-cyan-500/40 shadow-sm'
@@ -135,43 +147,51 @@ export const CollaboratorsPanel: FC<CollaboratorsPanelProps> = ({
                           </span>
                         )}
                       </div>
-                      <div className="flex items-center gap-1 text-[10px] text-slate-400 truncate">
-                        <FileCode className="w-2.5 h-2.5 text-slate-500" />
-                        <span className="truncate">{activeFileName}</span>
+                      <div className="flex items-center gap-1.5 text-[10px] text-slate-400 truncate">
+                        <span className={`w-1.5 h-1.5 rounded-full ${isClientHost ? 'bg-amber-400' : 'bg-emerald-400'} animate-pulse flex-shrink-0`} />
+                        <span className="font-mono text-slate-300 font-medium">
+                          {isClientHost ? 'HOST • Online' : isReadOnly ? 'VIEWER • Online' : 'MEMBER • Online'}
+                        </span>
+                        <span className="text-slate-600">•</span>
+                        <FileCode className="w-2.5 h-2.5 text-slate-500 flex-shrink-0" />
+                        <span className="truncate max-w-[80px]">{activeFileName}</span>
                       </div>
                     </div>
                   </div>
 
                   <div className="flex items-center gap-1">
-                    {client.isHost ? (
-                      <span className="flex items-center gap-1 text-[10px] bg-amber-500/15 text-amber-300 border border-amber-500/30 px-1.5 py-0.5 rounded font-medium">
-                        <Crown className="w-3 h-3" /> Host
+                    {isClientHost ? (
+                      <span className="flex items-center gap-1 text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40 px-2 py-0.5 rounded-md font-semibold tracking-wide shadow-sm">
+                        <Crown className="w-3 h-3 text-amber-400 fill-amber-400/30" /> HOST
+                      </span>
+                    ) : isReadOnly ? (
+                      <span className="flex items-center gap-1 text-[10px] bg-slate-800 text-slate-400 border border-slate-700/60 px-1.5 py-0.5 rounded-md font-mono">
+                        <Eye className="w-2.5 h-2.5 text-slate-400" /> VIEWER
                       </span>
                     ) : (
-                      <span className="flex items-center gap-1 text-[10px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded font-mono">
-                        {isReadOnly ? <Eye className="w-2.5 h-2.5" /> : <Edit3 className="w-2.5 h-2.5" />}
-                        <span>{isReadOnly ? 'Viewer' : 'Editor'}</span>
+                      <span className="flex items-center gap-1 text-[10px] bg-cyan-950/40 text-cyan-300 border border-cyan-800/40 px-1.5 py-0.5 rounded-md font-mono">
+                        <Edit3 className="w-2.5 h-2.5 text-cyan-400" /> MEMBER
                       </span>
                     )}
                   </div>
                 </div>
 
-                {/* Host Actions on peer */}
-                {isHost && !isMe && (
+                {/* Host Actions on peer: only visible to Host, and only on non-host peers */}
+                {isHost && !isClientHost && !isMe && (
                   <div className="mt-2 pt-2 border-t border-slate-800/60 flex items-center justify-end gap-1.5 text-[10px]">
                     <button
-                      onClick={() => onTransferHost?.(client.socketId, client.username)}
-                      className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-amber-300 hover:text-amber-200 flex items-center gap-1 cursor-pointer transition-colors"
-                      title="Make this user host"
+                      onClick={() => onTransferHost?.(client.socketId, client.username, client.userId)}
+                      className="px-2.5 py-1 rounded bg-amber-950/30 hover:bg-amber-900/50 text-amber-300 hover:text-amber-200 border border-amber-800/40 flex items-center gap-1 cursor-pointer transition-colors font-medium"
+                      title={`Make ${client.username} the room host`}
                     >
-                      <Crown className="w-2.5 h-2.5" /> Make Host
+                      <Crown className="w-3 h-3 text-amber-400" /> Make Host
                     </button>
                     <button
-                      onClick={() => onKickUser?.(client.socketId, client.username)}
-                      className="px-2 py-0.5 rounded bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/40 flex items-center gap-1 cursor-pointer transition-colors"
-                      title="Kick user from session"
+                      onClick={() => onKickUser?.(client.socketId, client.username, client.userId)}
+                      className="px-2.5 py-1 rounded bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 hover:text-rose-200 border border-rose-800/40 flex items-center gap-1 cursor-pointer transition-colors font-medium"
+                      title={`Kick ${client.username} from session`}
                     >
-                      <UserMinus className="w-2.5 h-2.5" /> Kick
+                      <UserMinus className="w-3 h-3 text-rose-400" /> Kick
                     </button>
                   </div>
                 )}
